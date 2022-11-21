@@ -36,6 +36,10 @@ agent_points_per_side_width: 16
 """
 text_format.Parse(config_text, config)
 
+
+SAVE_DIR = "./weights"
+FILES_DIR = "./preprocessed_data"
+
 REPLICA = 1
 
 # Hyper parameters
@@ -43,7 +47,6 @@ NUM_PRED_CHANNELS = 4
 BATCH_SIZE = 8
 EPOCHS = 15
 LR = 1e-4
-SAVE_DIR = "/work/vita/casademo/weights/torch"
 
 # loss weights
 ogm_weight = 1000.0
@@ -134,8 +137,8 @@ def setup(gpu_id):
     return model, loss_fn, optimizer, scheduler
 
 def get_dataloader(gpu_id, world_size):
-    tfrecord_pattern = "/work/vita/datasets/waymo110/preprocessed_data/train/{}.tfrecords"
-    files = os.listdir('/work/vita/datasets/waymo110/preprocessed_data/train')
+    tfrecord_pattern = FILES_DIR + "/train/{}.tfrecords"
+    files = os.listdir(FILES_DIR + "/train")
 
     splits = {file.split(".")[0]:1 for file in files}
 
