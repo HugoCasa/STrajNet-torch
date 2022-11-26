@@ -128,10 +128,10 @@ class OGMFlow_loss():
                 pred_waypoint_logits.vehicles.occluded_occupancy[k])
             pred_flow = pred_waypoint_logits.vehicles.flow[k]
 
-            true_observed_occupancy = true_waypoints.vehicles.observed_occupancy[k].to(device)
-            true_occluded_occupancy = true_waypoints.vehicles.occluded_occupancy[k].to(device)
+            true_observed_occupancy = true_waypoints.vehicles.observed_occupancy[k]
+            true_occluded_occupancy = true_waypoints.vehicles.occluded_occupancy[k]
         
-            true_flow = true_waypoints.vehicles.flow[k].to(device)
+            true_flow = true_waypoints.vehicles.flow[k]
 
   
             # Accumulate over waypoints.
@@ -147,7 +147,7 @@ class OGMFlow_loss():
                     loss_weight=self.occ_weight))
             
             true_all_occupancy = torch.clamp(true_observed_occupancy + true_occluded_occupancy, 0, 1)
-            flow_origin_occupancy = true_waypoints.vehicles.flow_origin_occupancy[k].to(device)
+            flow_origin_occupancy = true_waypoints.vehicles.flow_origin_occupancy[k]
             if self.use_gt:
                 warped_indices = identity_indices + true_flow
                 wp_org = sample(
