@@ -3,6 +3,9 @@ import torch
 import torchvision.ops as ops
 import torch.nn.functional as F
 
+from waymo_open_dataset.protos import occupancy_flow_metrics_pb2
+from google.protobuf import text_format
+
 from sklearn import metrics
 
 import occupancy_flow_grids
@@ -316,12 +319,57 @@ class OGMFlow_loss():
         flow_exists = flow_exists.to(torch.float32)
         diff = diff * flow_exists
         diff_norm = torch.linalg.norm(diff, ord=1, dim=-1)  # L1 norm.
-        mean_diff = torch.nan_to_num(torch.div(
-            torch.sum(diff_norm),
-            (torch.sum(flow_exists)*self.replica / 2)), posinf=0, neginf=0)  # / 2 since (dx, dy) is counted twice.
+        diff_norm_sum = torch.sum(diff_norm)
+        flow_exists_sum = torch.sum(flow_exists)*self.replica / 2 # / 2 since (dx, dy) is counted twice.
+        if torch.is_nonzero(flow_exists_sum):
+            mean_diff = torch.div(diff_norm_sum, flow_exists_sum)
+        else:
+            mean_diff = 0
         return loss_weight * mean_diff
 
     def _batch_flatten(self,input_tensor: torch.Tensor) -> torch.Tensor:
         """Flatten tensor to a shape [batch_size, -1]."""
         image_shape = input_tensor.size()
         return torch.reshape(input_tensor, [*image_shape[0:1], -1])
+
+
+def test_loss():
+
+
+    dummy_pred_waypoint_logits = occupancy_flow_grids.WaypointGrids()
+    dummy_true_waypoints = occupancy_flow_grids.WaypointGrids()
+    for _ in range(8):
+        dummy_pred_waypoint_logits.vehicles.observed_occupancy.append(torch.zeros(1, 256, 256, 1))
+        dummy_pred_waypoint_logits.vehicles.occluded_occupancy.append(torch.zeros(1, 256, 256, 1))
+        dummy_pred_waypoint_logits.vehicles.flow.append(torch.zeros(1, 256, 256, 2))
+
+        dummy_true_waypoints.vehicles.observed_occupancy.append(torch.zeros(1, 256, 256, 1))
+        dummy_true_waypoints.vehicles.occluded_occupancy.append(torch.zeros(1, 256, 256, 1))
+        dummy_true_waypoints.vehicles.flow.append(torch.zeros(1, 256, 256, 2))
+        dummy_true_waypoints.vehicles.flow_origin_occupancy.append(torch.zeros(1, 256, 256, 1))
+
+    config = occupancy_flow_metrics_pb2.OccupancyFlowTaskConfig()
+    config_text = """
+    num_past_steps: 10
+    num_future_steps: 80
+    num_waypoints: 8
+    cumulative_waypoints: false
+    normalize_sdc_yaw: true
+    grid_height_cells: 256
+    grid_width_cells: 256
+    sdc_y_in_grid: 192
+    sdc_x_in_grid: 128
+    pixels_per_meter: 3.2
+    agent_points_per_side_length: 48
+    agent_points_per_side_width: 16
+    """
+    text_format.Parse(config_text, config)
+
+
+    loss_fn = OGMFlow_loss(config, replica=1, no_use_warp=False, use_pred=False, use_gt=True, use_focal_loss=False)
+
+    loss_fn(true_waypoints=dummy_true_waypoints,pred_waypoint_logits=dummy_pred_waypoint_logits,curr_ogm=None)
+
+
+if __name__ == "__main__":
+    test_loss()

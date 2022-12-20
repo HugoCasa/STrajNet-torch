@@ -199,7 +199,7 @@ def sample(image: torch.Tensor,
         warp = torch.math.round(warp)
 
     if border_type == BorderType.ZERO:
-        image = F.pad(image.permute(0,3,1,2), (0,1,1,0)).permute(0,2,3,1)
+        image = F.pad(image, (0,0,1,1,1,1,0,0))
         warp = warp + 1
 
     warp_shape = warp.size()
@@ -316,7 +316,7 @@ def _compute_occupancy_auc(
   Returns:
     AUC: float32 scalar.
   """
-  return binary_average_precision(preds=pred_occupancy, target=true_occupancy.to(int), thresholds=100)
+  return binary_average_precision(preds=pred_occupancy, target=true_occupancy.to(torch.int8), thresholds=100)
 
 
 def _compute_occupancy_soft_iou(
