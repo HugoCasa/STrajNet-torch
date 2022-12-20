@@ -2,6 +2,7 @@
 import os
 import torch
 import torch.nn as nn
+import math
 import copy
 import numpy as np
 from waymo_open_dataset.protos import occupancy_flow_metrics_pb2
@@ -10,18 +11,22 @@ import occupancy_flow_grids
 
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import init_process_group, destroy_process_group
 
 from loss import OGMFlow_loss
 
 from strajNet import STrajNet
-from dataset import DistributedMultiTFRecordDataset
 
 from torchmetrics import MeanMetric
 import occu_metric as occupancy_flow_metrics
 from metrics import OGMFlowMetrics, print_metrics
 
+from filesDataset import FilesDataset
+
 from time import time
+from tqdm import tqdm
+import sys
 
 config = occupancy_flow_metrics_pb2.OccupancyFlowTaskConfig()
 config_text = """
@@ -130,27 +135,24 @@ def val_metric_func(config,true_waypoints,pred_waypoints):
         no_warp=False
     )
 
-def parse_record(record):
-    features = copy.deepcopy(record)
-    new_dict = {}
-    # print(features['actors'].tostring())
-    new_dict['centerlines'] = torch.reshape(torch.frombuffer(features['centerlines'],dtype=torch.float64),[256,10,7]).to(torch.float32)
+def parse_record(features):
 
-    new_dict['actors'] = torch.reshape(torch.frombuffer(features['actors'], dtype=torch.float64), [48,11,8]).to(torch.float32)
-    new_dict['occl_actors'] = torch.reshape(torch.frombuffer(features['occl_actors'], dtype=torch.float64), [16,11,8]).to(torch.float32)
+    features['centerlines'] = features['centerlines'].to(torch.float32)
 
-    new_dict['gt_flow'] = torch.reshape(torch.frombuffer(features['gt_flow'], dtype=torch.float32), [8,512,512,2])[:,128:128+256,128:128+256,:]
-    new_dict['origin_flow'] = torch.reshape(torch.frombuffer(features['origin_flow'], dtype=torch.float32), [8,512,512,1])[:,128:128+256,128:128+256,:]
+    features['actors'] = features['actors'].to(torch.float32)
+    features['occl_actors'] = features['occl_actors'].to(torch.float32)
 
-    new_dict['ogm'] = torch.reshape(torch.frombuffer(features['ogm'], dtype=torch.bool), [512,512,11,2]).to(torch.float32)
+    features['ogm'] = features['ogm'].to(torch.float32)
 
-    new_dict['gt_obs_ogm'] = torch.reshape(torch.frombuffer(features['gt_obs_ogm'], dtype=torch.bool), [8,512,512,1]).to(torch.float32)[:,128:128+256,128:128+256,:]
-    new_dict['gt_occ_ogm'] = torch.reshape(torch.frombuffer(features['gt_occ_ogm'], dtype=torch.bool), [8,512,512,1]).to(torch.float32)[:,128:128+256,128:128+256,:]
-    
-    new_dict['map_image'] = (torch.reshape(torch.frombuffer(features['map_image'], dtype=torch.int8), [256,256,3]).to(torch.float32) / 256)
-    new_dict['vec_flow'] = torch.reshape(torch.frombuffer(features['vec_flow'], dtype=torch.float32), [512,512,2])
+    features['map_image'] = (features['map_image'].to(torch.float32) / 256)
+    features['vec_flow'] = features['vec_flow']
 
-    return new_dict
+    features['gt_flow'] = features['gt_flow'][:,128:128+256,128:128+256,:]
+    features['origin_flow'] = features['origin_flow'][:,128:128+256,128:128+256,:]
+    features['gt_obs_ogm'] = features['gt_obs_ogm'].to(torch.float32)[:,128:128+256,128:128+256,:]
+    features['gt_occ_ogm'] = features['gt_occ_ogm'].to(torch.float32)[:,128:128+256,128:128+256,:]
+
+    return features
 
 
 
@@ -166,40 +168,34 @@ def setup(gpu_id):
     return model, loss_fn, optimizer, scheduler
 
 def get_dataloader(gpu_id, world_size):
-    tfrecord_pattern = FILES_DIR + "/train/{}.tfrecords"
-    files = os.listdir(FILES_DIR + "/train")
 
-    splits = {file.split(".")[0]:1 for file in files}
+    dataset = FilesDataset(
+        path=FILES_DIR + '/train_numpy', 
+        transform=parse_record
+    )
 
-    dataset = DistributedMultiTFRecordDataset(
-                            tfrecord_pattern,
-                            index_pattern=None,
-                            splits=splits,
-                            compression_type="gzip",
-                            transform=parse_record,
-                            shuffle_queue_size=64,
-                            infinite=False,
-                            gpu_id=gpu_id,
-                            world_size=world_size)
-    
-    train_loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE)
+    train_loader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, # done by the sampler
+        pin_memory=True,
+        num_workers=4,
+        sampler=DistributedSampler(dataset)
+    )
 
-    val_tfrecord_patten = FILES_DIR + "/val/{}.tfrecords"
-    val_files = os.listdir(FILES_DIR + '/val')
+    val_dataset = FilesDataset(
+        path=FILES_DIR + '/val_numpy',
+        transform=parse_record
+    )
 
-    val_splits = {file.split(".")[0]:1 for file in val_files}
-
-    val_dataset = DistributedMultiTFRecordDataset(
-                            val_tfrecord_patten,
-                            index_pattern=None,
-                            splits=val_splits,
-                            compression_type="gzip",
-                            transform=parse_record,
-                            infinite=False,
-                            gpu_id=gpu_id,
-                            world_size=world_size)
-
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, # done by the sampler
+        pin_memory=True,
+        num_workers=4,
+        sampler=DistributedSampler(val_dataset)
+    )
 
     return train_loader, val_loader
 
@@ -218,21 +214,25 @@ def model_training(gpu_id, world_size):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         continue_ep = checkpoint['epoch'] + 1
-        print(f'Continue_training...ep:{continue_ep+1}')
+        if gpu_id == 0:
+            print(f'Continue_training...ep:{continue_ep+1}')
     else:
         continue_ep = 0
 
     
-
+    train_size = 0
+    val_size = 0
     for epoch in range(EPOCHS):
 
         if epoch<continue_ep:
-            print("\nskip epoch {}/{}".format(epoch+1, EPOCHS))
+            if gpu_id == 0:
+                print("\nskip epoch {}/{}".format(epoch+1, EPOCHS))
             continue
 
         # TRAINING
-        print(f"[GPU{gpu_id}] Epoch {epoch+1}\n-------------------------------")
-        size = 487008 // world_size
+        if gpu_id == 0:
+            print(f"Epoch {epoch+1}\n-------------------------------")
+        size = train_size or 0
         train_loss = MeanMetric().to(gpu_id)
         train_loss_occ = MeanMetric().to(gpu_id)
         train_loss_flow = MeanMetric().to(gpu_id)
@@ -240,7 +240,10 @@ def model_training(gpu_id, world_size):
 
         model.train()
 
-        for batch, data in enumerate(train_loader):
+        train_loader.sampler.set_epoch(epoch)
+
+        loop = tqdm(enumerate(train_loader), total=math.ceil(size/(BATCH_SIZE*world_size))) if gpu_id == 0 else enumerate(train_loader)
+        for batch, data in loop:
             # inputs: will automatically be put on right device when passed to model 
             map_img = data['map_image']
             centerlines = data['centerlines']
@@ -261,7 +264,7 @@ def model_training(gpu_id, world_size):
             logits = _get_pred_waypoint_logits(outputs)
             loss_dict = loss_fn(true_waypoints=true_waypoints,pred_waypoint_logits=logits,curr_ogm=ogm[:,:,:,-1,0])
             loss_value = torch.sum(sum(loss_dict.values()))
-       
+    
             optimizer.zero_grad()
             loss_value.backward()
             optimizer.step()
@@ -276,16 +279,20 @@ def model_training(gpu_id, world_size):
             flow_loss = train_loss_flow.compute()/flow_weight
             warp_loss = train_loss_warp.compute()/flow_origin_weight
             
-            current = (batch + 1) * BATCH_SIZE
-            print(f"[GPU{gpu_id}] obs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
+            if gpu_id == 0:
+                batch_size = data['ogm'].size(dim=0)
+                if epoch == 0:
+                    train_size += batch_size * world_size
+                current = (batch * BATCH_SIZE + batch_size) * world_size
+                print(f"\nobs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
         
 
         scheduler.step()
 
-
         # VALIDATION
-        print(f"[GPU{gpu_id}] Validation\n-------------------------------")
-        size = 4400 // world_size
+        if gpu_id == 0:
+            print(f"Validation\n-------------------------------")
+        size = val_size or 0
         valid_loss = MeanMetric().to(gpu_id)
         valid_loss_occ = MeanMetric().to(gpu_id)
         valid_loss_flow = MeanMetric().to(gpu_id)
@@ -296,8 +303,8 @@ def model_training(gpu_id, world_size):
 
         model.eval()
         with torch.no_grad():
-
-            for batch, data in enumerate(val_loader):
+            loop = tqdm(enumerate(val_loader), total=math.ceil(size/(BATCH_SIZE*world_size))) if gpu_id == 0 else enumerate(val_loader)
+            for batch, data in loop:
                 # inputs: will automatically be put on right device when passed to model 
                 map_img = data['map_image']
                 centerlines = data['centerlines']
@@ -335,14 +342,19 @@ def model_training(gpu_id, world_size):
                 flow_loss = valid_loss_flow.compute()/flow_weight
                 warp_loss = valid_loss_warp.compute()/flow_origin_weight
                 
-                current = (batch + 1) * BATCH_SIZE
-                print(f"[GPU{gpu_id}] obs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
+                if gpu_id == 0:
+                    batch_size = data['ogm'].size(dim=0)
+                    if epoch == 0:
+                        val_size += batch_size * world_size
+                    current = (batch * BATCH_SIZE + batch_size) * world_size
+                    print(f"\nobs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
 
 
         val_res_dict = valid_metrics.compute()
-        print_metrics(val_res_dict, no_warp=False)
+        
+        if gpu_id == 0:
+            print_metrics(val_res_dict, no_warp=False)
 
-        if (gpu_id == 0):
             # save checkpoint
             torch.save({
                 'epoch': epoch,
