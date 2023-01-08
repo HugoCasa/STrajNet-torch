@@ -45,12 +45,10 @@ agent_points_per_side_width: 16
 """
 text_format.Parse(config_text, config)
 
-
+# Parameters
 SAVE_DIR = "./weights"
 FILES_DIR = "./preprocessed_data"
 CHECKPOINT_PATH = None
-
-REPLICA = 1
 
 # Hyper parameters
 NUM_PRED_CHANNELS = 4
@@ -136,6 +134,9 @@ def val_metric_func(config,true_waypoints,pred_waypoints):
     )
 
 def parse_record(features):
+    """
+    Convert features to the right types
+    """
 
     features['centerlines'] = features['centerlines'].to(torch.float32)
 
@@ -157,17 +158,23 @@ def parse_record(features):
 
 
 def setup(gpu_id):
+    """
+    Setup model, DDP, loss, optimizer and scheduler
+    """
     cfg=dict(input_size=(512,512), window_size=8, embed_dim=96, depths=[2,2,2], num_heads=[3,6,12])
     model = STrajNet(cfg,actor_only=True,sep_actors=False, fg_msa=True, fg=True).to(gpu_id)
     model = DDP(model, device_ids=[gpu_id])
-    loss_fn = OGMFlow_loss(config, replica=REPLICA,no_use_warp=False,use_pred=False,use_gt=True,
-    ogm_weight=ogm_weight, occ_weight=occ_weight,flow_origin_weight=flow_origin_weight,flow_weight=flow_weight,use_focal_loss=False)
+    loss_fn = OGMFlow_loss(config,no_use_warp=False,use_pred=False,use_gt=True,
+    ogm_weight=ogm_weight, occ_weight=occ_weight,flow_origin_weight=flow_origin_weight,flow_weight=flow_weight,use_focal_loss=True)
     optimizer = torch.optim.NAdam(model.parameters(), lr=LR) 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=int(30438*1.5), T_mult=1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 3, 0.5) 
     return model, loss_fn, optimizer, scheduler
 
 def get_dataloader(gpu_id, world_size):
+    """
+    Get training and validation dataloaders
+    """
 
     dataset = FilesDataset(
         path=FILES_DIR + '/train_numpy', 
@@ -200,6 +207,9 @@ def get_dataloader(gpu_id, world_size):
     return train_loader, val_loader
 
 def model_training(gpu_id, world_size):
+    """
+    Model training and validation
+    """
 
     ddp_setup(gpu_id, world_size)
 
@@ -208,6 +218,7 @@ def model_training(gpu_id, world_size):
 
 
     if CHECKPOINT_PATH is not None:
+        # if checkpoint path given, load weights
         map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu_id}
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=map_location)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -258,21 +269,25 @@ def model_training(gpu_id, world_size):
             gt_flow = data['gt_flow'].to(gpu_id)
             origin_flow = data['origin_flow'].to(gpu_id)
 
-            true_waypoints = _warpped_gt(gt_ogm=gt_obs_ogm,gt_occ=gt_occ_ogm,gt_flow=gt_flow,origin_flow=origin_flow)
-
+            # forward pass
             outputs = model(ogm,map_img,obs=actors,occ=occl_actors,mapt=centerlines,flow=flow)
+
+            # compute loss
+            true_waypoints = _warpped_gt(gt_ogm=gt_obs_ogm,gt_occ=gt_occ_ogm,gt_flow=gt_flow,origin_flow=origin_flow)
             logits = _get_pred_waypoint_logits(outputs)
             loss_dict = loss_fn(true_waypoints=true_waypoints,pred_waypoint_logits=logits,curr_ogm=ogm[:,:,:,-1,0])
             loss_value = torch.sum(sum(loss_dict.values()))
     
+            # backward pass
             optimizer.zero_grad()
             loss_value.backward()
             optimizer.step()
 
-            train_loss.update(loss_dict['observed_xe']*REPLICA)
-            train_loss_occ.update(loss_dict['occluded_xe']*REPLICA)
-            train_loss_flow.update(loss_dict['flow']*REPLICA)
-            train_loss_warp.update(loss_dict['flow_warp_xe']*REPLICA)
+            # update losses
+            train_loss.update(loss_dict['observed_xe'])
+            train_loss_occ.update(loss_dict['occluded_xe'])
+            train_loss_flow.update(loss_dict['flow'])
+            train_loss_warp.update(loss_dict['flow_warp_xe'])
 
             obs_loss = train_loss.compute()/ogm_weight
             occ_loss = train_loss_occ.compute()/occ_weight
@@ -280,9 +295,8 @@ def model_training(gpu_id, world_size):
             warp_loss = train_loss_warp.compute()/flow_origin_weight
             
             if gpu_id == 0:
+                # print training losses
                 batch_size = data['ogm'].size(dim=0)
-                if epoch == 0:
-                    train_size += batch_size * world_size
                 current = (batch * BATCH_SIZE + batch_size) * world_size
                 print(f"\nobs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
         
@@ -291,6 +305,7 @@ def model_training(gpu_id, world_size):
 
         # VALIDATION
         if gpu_id == 0:
+            train_size = current
             print(f"Validation\n-------------------------------")
         size = val_size or 0
         valid_loss = MeanMetric().to(gpu_id)
@@ -319,19 +334,21 @@ def model_training(gpu_id, world_size):
                 gt_flow = data['gt_flow'].to(gpu_id)
                 origin_flow = data['origin_flow'].to(gpu_id)
 
-                true_waypoints = _warpped_gt(gt_ogm=gt_obs_ogm,gt_occ=gt_occ_ogm,gt_flow=gt_flow,origin_flow=origin_flow)
 
+                # forward pass
                 outputs = model(ogm,map_img,obs=actors,occ=occl_actors,mapt=centerlines,flow=flow)
 
+                # compute losses
+                true_waypoints = _warpped_gt(gt_ogm=gt_obs_ogm,gt_occ=gt_occ_ogm,gt_flow=gt_flow,origin_flow=origin_flow)
                 logits = _get_pred_waypoint_logits(outputs)
-
                 loss_dict = loss_fn(true_waypoints=true_waypoints,pred_waypoint_logits=logits,curr_ogm=ogm[:,:,:,-1,0])
                 loss_value = torch.sum(sum(loss_dict.values()))
 
-                valid_loss.update(loss_dict['observed_xe']*REPLICA)
-                valid_loss_occ.update(loss_dict['occluded_xe']*REPLICA)
-                valid_loss_flow.update(loss_dict['flow']*REPLICA)
-                valid_loss_warp.update(loss_dict['flow_warp_xe']*REPLICA)
+                # update losses
+                valid_loss.update(loss_dict['observed_xe'])
+                valid_loss_occ.update(loss_dict['occluded_xe'])
+                valid_loss_flow.update(loss_dict['flow'])
+                valid_loss_warp.update(loss_dict['flow_warp_xe'])
                 
                 pred_waypoints = _apply_sigmoid_to_occupancy_logits(logits)
                 metrics = val_metric_func(config,true_waypoints,pred_waypoints)
@@ -343,9 +360,8 @@ def model_training(gpu_id, world_size):
                 warp_loss = valid_loss_warp.compute()/flow_origin_weight
                 
                 if gpu_id == 0:
+                    # print validation losses
                     batch_size = data['ogm'].size(dim=0)
-                    if epoch == 0:
-                        val_size += batch_size * world_size
                     current = (batch * BATCH_SIZE + batch_size) * world_size
                     print(f"\nobs. loss: {obs_loss:>7f}, occl. loss:  {occ_loss:>7f}, flow loss: {flow_loss:>7f}, warp loss: {warp_loss:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
 
@@ -353,6 +369,9 @@ def model_training(gpu_id, world_size):
         val_res_dict = valid_metrics.compute()
         
         if gpu_id == 0:
+            val_size = current
+
+            # print validation metrics
             print_metrics(val_res_dict, no_warp=False)
 
             # save checkpoint
@@ -368,14 +387,6 @@ def model_training(gpu_id, world_size):
 
 if __name__ == "__main__":
 
-    
-
     world_size = torch.cuda.device_count()
 
     mp.spawn(model_training, args=[world_size], nprocs=world_size)
-
-
-
-    # model_training(train_loader)
-    # data = next(iter(loader))
-    # print(data)
