@@ -132,13 +132,17 @@ class Pyramid3DDecoder(nn.Module):
             x = x.permute(0,4,1,2,3)
             x = upsample(x)
             B, C, D, H, W = x.size()
+            x = x.permute(0,2,1,3,4) # B, D, C, H, W
             x = x.reshape([-1, C, H, W])
             x = uconv_0(x)
-            x = x.reshape([B, D, H, W, -1])
+            x = x.permute(0,2,3,1) # B*D, H, W, C
+            x = x.reshape([B, D, H, W, -1]) # B, D, H, W, C
         
         B, D, H, W, C = x.size()
+        x = x.permute(0,1,4,2,3) # B, D, C, H, W
         x = x.reshape([-1, C, H, W])
         x = self.output_layer_f(x)
+        x = x.permute(0,2,3,1) # B*D, H, W, C
         x = x.reshape([B, D, H, W, -1])
         return x
     
@@ -151,12 +155,14 @@ class Pyramid3DDecoder(nn.Module):
             res_list = res_list[1:]
         
         for upsample,uconv_0 in zip(self.upsample,self.upconv_0s):
-            x = x.permute(0,4,1,2,3)
+            x = x.permute(0,4,1,2,3) # B, C, D, H, W
             x = upsample(x)
             B, C, D, H, W = x.size()
-            x = x.reshape([-1, C, H, W])
+            x = x.permute(0,2,1,3,4) # change to B, D, C, H, W
+            x = x.reshape([-1, C, H, W]) # B*D, C, H, W
             x = uconv_0(x)
-            x = x.reshape([B, D, H, W, -1])
+            x = x.permute(0,2,3,1) # B*D, H, W, C
+            x = x.reshape([B, D, H, W, -1]) # B, D, H, W, C
 
             if self.use_pyramid and i<=len(self.ind_list)-1:
                 if self.rep_res:
@@ -168,18 +174,20 @@ class Pyramid3DDecoder(nn.Module):
                     res_flat = res_flat.detach()
                 h = res_flat.size()[-1]
                 res_flat = torch.reshape(res_flat,[-1,8,self.reshape_dim[i],self.reshape_dim[i],h])
-                res_flat = res_flat.permute(0,4,1,2,3) 
+                res_flat = res_flat.permute(0,4,1,2,3) # B, C, D, H, W
                 x = x + self.res_layer[i](res_flat).permute(0,2,3,4,1)
 
             if i==len(self.ind_list)-1 and self.flow_sep_decode:
                 flow_res = torch.reshape(flow_res,[-1,64,64,96])
                 flow_res = torch.repeat_interleave(flow_res[:,np.newaxis],repeats=8,dim=1)
-                flow_res = flow_res.permute(0,4,1,2,3)
+                flow_res = flow_res.permute(0,4,1,2,3) # B, C, D, H, W
                 flow_x = x + self.res_f(flow_res).permute(0,2,3,4,1)
             i+=1
         B, D, H, W, C = x.size()
-        x = x.reshape([-1, C, H, W])
+        x = x.permute(0,1,4,2,3) # B, D, C, H, W
+        x = x.reshape([-1, C, H, W]) # B*D, C, H, W
         x = self.output_layer(x)
+        x = x.permute(0,2,3,1) # B*D, H, W, C
         x = x.reshape([B, D, H, W, -1])
         if self.flow_sep_decode:
             flow_x = self.get_flow_output(flow_x)
