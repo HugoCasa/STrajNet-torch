@@ -1,5 +1,6 @@
 import submitit
 import logging
+import datetime
 
 # import os
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -11,6 +12,7 @@ logging.basicConfig(level=logging.INFO)
 SAVE_DIR = "./weights"
 FILES_DIR = "./waymo110/preprocessed_data"
 CHECKPOINT_PATH = None
+TB_DIR = "./tensorboard/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 # Training parameters
 LR = 1e-4
@@ -37,6 +39,7 @@ def main():
         epochs=EPOCHS,
         save_dir=SAVE_DIR,
         files_dir=FILES_DIR,
+        tb_dir=TB_DIR,
         checkpoint_path=CHECKPOINT_PATH,
         local=LOCAL,
     )

@@ -8,6 +8,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 from waymo_open_dataset.protos import occupancy_flow_metrics_pb2
 from google.protobuf import text_format
@@ -58,6 +59,7 @@ class Trainer:
         epochs: int,
         files_dir: str,
         save_dir: str,
+        tb_dir: str,
         checkpoint_path: str = None,
         local=False,
     ):
@@ -66,6 +68,7 @@ class Trainer:
         self.epochs = epochs
         self.files_dir = files_dir
         self.save_dir = save_dir
+        self.tb_dir = tb_dir
         self.checkpoint_path = checkpoint_path
         self.local = local
 
@@ -74,6 +77,8 @@ class Trainer:
             self._setup_local()
         else:
             self._setup_slurm()
+        if self.dist_env.rank == 0:
+            self.tb_writer = SummaryWriter(self.tb_dir)
         self._train()
 
     def _setup_slurm(self):
@@ -197,7 +202,11 @@ class Trainer:
         # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 3, 0.5)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=self.lr, epochs=self.epochs, steps_per_epoch=len(train_loader)
+            optimizer,
+            max_lr=self.lr,
+            epochs=self.epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.15,
         )
 
         if self.checkpoint_path is not None:
@@ -220,7 +229,7 @@ class Trainer:
                 continue
 
             LOG.info(f"Epoch {epoch+1}\n-------------------------------")
-            LOG.info(f"Learning rate: {scheduler.get_lr()}")
+            LOG.info(f"Learning rate: {scheduler.get_last_lr()}")
             train_loss = MeanMetric().to(local_rank)
             train_loss_occ = MeanMetric().to(local_rank)
             train_loss_flow = MeanMetric().to(local_rank)
@@ -294,6 +303,20 @@ class Trainer:
                     flush=True,
                 )
 
+                if self.dist_env.rank == 0:
+                    total = len(train_loader)
+                    self.tb_writer.add_scalar(
+                        "train_loss/obs", obs_loss, epoch * total + batch_idx
+                    )
+                    self.tb_writer.add_scalar(
+                        "train_loss/occ", occ_loss, epoch * total + batch_idx
+                    )
+                    self.tb_writer.add_scalar(
+                        "train_loss/flow", flow_loss, epoch * total + batch_idx
+                    )
+                    self.tb_writer.add_scalar(
+                        "train_loss/warp", warp_loss, epoch * total + batch_idx
+                    )
 
             LOG.info("Validation\n-------------------------------")
 
@@ -375,6 +398,34 @@ class Trainer:
 
             val_res_dict = valid_metrics.compute()
             print_metrics(val_res_dict, no_warp=False)
+
+            if self.dist_env.rank == 0:
+                # save to tensorboard losses and metrics
+                self.tb_writer.add_scalar("val_loss/obs", obs_loss, epoch)
+                self.tb_writer.add_scalar("val_loss/occ", occ_loss, epoch)
+                self.tb_writer.add_scalar("val_loss/flow", flow_loss, epoch)
+                self.tb_writer.add_scalar("val_loss/warp", warp_loss, epoch)
+                self.tb_writer.add_scalar(
+                    "val_metrics/obs_auc", val_res_dict["observed_auc"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/obs_iou", val_res_dict["observed_iou"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/occ_auc", val_res_dict["occluded_auc"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/occ_iou", val_res_dict["occluded_iou"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/flow_epe", val_res_dict["flow_epe"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/flow_ogm_auc", val_res_dict["flow_ogm_auc"], epoch
+                )
+                self.tb_writer.add_scalar(
+                    "val_metrics/flow_ogm_iou", val_res_dict["flow_ogm_iou"], epoch
+                )
 
             if self.dist_env.rank == 0:  # global rank = 0
                 LOG.info("Saving model\n-------------------------------")
