@@ -177,7 +177,7 @@ class Pyramid3DDecoder(nn.Module):
                 res_flat = res_flat.permute(0,4,1,2,3) # B, C, D, H, W
                 x = x + self.res_layer[i](res_flat).permute(0,2,3,4,1)
 
-            if i==len(self.ind_list)-1 and self.flow_sep_decode:
+            if self.flow_sep_decode and i==len(self.ind_list)-1:
                 flow_res = torch.reshape(flow_res,[-1,64,64,96])
                 flow_res = torch.repeat_interleave(flow_res[:,np.newaxis],repeats=8,dim=1)
                 flow_res = flow_res.permute(0,4,1,2,3) # B, C, D, H, W
